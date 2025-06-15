@@ -12,7 +12,7 @@ import os
 import sys
 import multiprocessing
 from AudioStreamDescriptor import XWAVhdr
-from firmware_config.firmware_1240 import SAMPLE_RATE
+
 
 #Added from npy version for xwavs
 import soundfile as sf
