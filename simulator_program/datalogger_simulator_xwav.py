@@ -1,3 +1,5 @@
+from pyexpat.errors import XML_ERROR_UNKNOWN_ENCODING
+from re import X
 import struct
 import socket
 import numpy as np
@@ -9,6 +11,19 @@ import psutil
 import os
 import sys
 import multiprocessing
+from AudioStreamDescriptor import XWAVhdr
+from firmware_config.firmware_1240 import SAMPLE_RATE
+
+#Added from npy version for xwavs
+import soundfile as sf
+
+'''Edits by Kasey to stream full wxav with no additional processing.
+NEED TO CHANGE: UTILS XWAV
+XWAV PROCESSOR
+'''
+
+#Local utilities (assumes these functions exist in utils_xWavSim.py)
+from utils_xWavSim import get_datetime, extract_wav_start, read_xwav_audio
 
 # Local utilities (assumes these functions exist in utils.py)
 from utils import SetHighPriority, ReadBinaryData, DuplicateAndShiftChannels, InterleaveData, ScaleData, ConvertToBytes, Sleep, TDOASimAction
@@ -35,6 +50,42 @@ class ArgumentParserService:
         parser.add_argument('--imu', action='store_true', help='Read in IMU data from file')
         parsedArgs = parser.parse_args()
         return parsedArgs
+
+class XWAVFileProcessor:
+    """
+    Responsible for loading and transforming .xwav files into byte data for streaming.
+    
+    Added by K.C.
+    Adapts .npy processor to  handle .xwav files, including reading headers and data.
+    """
+    @staticmethod
+    def processXwavFile(xwav_file_path):
+        """
+        Load the .xwav file and prepare it for UDP transmission.
+        The processed bytes are stored in a shared returnDict under 'dataBytes'.
+        """
+        print("Loading file:", xwav_file_path)
+        # Load the xwav file header to extract metadata
+        wav_start_time = extract_wav_start(xwav_file_path)
+        header = XWAVhdr(xwav_file_path)
+        number_channels  = header.xhd["NumChannels"]
+        sample_rate = header.xhd["SampleRate"]
+        bits_per_sample = header.xhd['BitsPerSample']
+        bytes_per_sample = bits_per_sample / 8
+
+
+        # Load the waveform data for chunking and sending to UDP
+        
+        #print(f"Loaded waveform with shape: {waveform.shape} and sample rate: {sr}")
+        data, sr = read_xwav_audio(xwav_file_path)
+        print(f"Number of channels: {number_channels}, Bytes per sample: {bytes_per_sample}")
+        print(f"Sample rate: {sample_rate}, Start time: {wav_start_time}")
+        print(f"Data shape: {data.shape}")
+
+
+
+
+
 
 class NpyFileProcessor:
     """
@@ -326,5 +377,10 @@ if __name__ == "__main__":
     # Parse command-line arguments
     arguments = ArgumentParserService.parseArguments()
     print("Parsed arguments:", arguments)
+    print("1 Channel Example:")
+    XWAVFileProcessor.processXwavFile("G:\\GOM_DT_15_disk01\\GOM_DT_15_220713_013459.x.wav")
+
+    print("4 Channel Example:")
+    XWAVFileProcessor.processXwavFile("F:\\GOM_GC_14_01_C4_disk01\\GOM_GC_14_01_C4_210907_150027.x.wav")
     #dataSimulator = DataSimulator(arguments)
     #dataSimulator.run()

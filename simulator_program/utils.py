@@ -9,9 +9,6 @@ import argparse
 import scipy
 print("scipy", scipy.__version__)
 
-
-
-
 class TDOASimAction(argparse.Action):
     """
     Custom argparse action to handle the --tdoa_sim argument.
@@ -44,7 +41,6 @@ def LoadHydrophonePositions(filePath):
     ])
 
     return H
-
 
 def CheckSystem():
     """
