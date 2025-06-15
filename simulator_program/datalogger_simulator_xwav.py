@@ -35,18 +35,13 @@ class ArgumentParserService:
     """Handles command-line argument parsing, providing a single responsibility."""
     @staticmethod
     def parseArguments():
+        #Modified to remove fully simulated data and use xwav files instead.
         parser = argparse.ArgumentParser(description='Program command line arguments')
         parser.add_argument('--port', default=1045, type=int, help='UDP port to send data to')
         parser.add_argument('--ip', default="192.168.7.2", type=str, help='IP address to send data to')
         parser.add_argument('--data_dir', default="simulator_data/track132_5minchunks/", type=str, help='Directory containing .npy data files')
-        parser.add_argument('--fw', default=1240, type=int, help='Firmware version to simulate')
         parser.add_argument('--loop', action='store_true', help='Enable looping over the data')
         parser.add_argument('--stretch', action='store_true', help='Normalize data values to the min/max range of 16-bit unsigned int')
-        parser.add_argument('--high_act', action='store_true', help='Enable high activity mode')
-        parser.add_argument('--cos_shift', action='store_true', help='Pad data variably according to a cosine wave')
-        parser.add_argument('--time_glitch', default=0, type=int, help='Simulate time glitch at specific data chunk index')
-        parser.add_argument('--data_glitch', default=0, type=int, help='Simulate data glitch at specific data chunk index')
-        parser.add_argument('--tdoa_sim', nargs='?', const=0, type=int, default=False, action=TDOASimAction, help='Channel offset amount')
         parser.add_argument('--imu', action='store_true', help='Read in IMU data from file')
         parsedArgs = parser.parse_args()
         return parsedArgs
@@ -59,7 +54,7 @@ class XWAVFileProcessor:
     Adapts .npy processor to  handle .xwav files, including reading headers and data.
     """
     @staticmethod
-    def processXwavFile(xwav_file_path):
+    def processXwavFile(xwav_file_path, return_dict, expected_channels, data_scale, stretch, fw):
         """
         Load the .xwav file and prepare it for UDP transmission.
         The processed bytes are stored in a shared returnDict under 'dataBytes'.
@@ -68,62 +63,33 @@ class XWAVFileProcessor:
         # Load the xwav file header to extract metadata
         wav_start_time = extract_wav_start(xwav_file_path)
         header = XWAVhdr(xwav_file_path)
-        number_channels  = header.xhd["NumChannels"]
-        sample_rate = header.xhd["SampleRate"]
-        bits_per_sample = header.xhd['BitsPerSample']
-        bytes_per_sample = bits_per_sample / 8
-
-
-        # Load the waveform data for chunking and sending to UDP
         
         #print(f"Loaded waveform with shape: {waveform.shape} and sample rate: {sr}")
         data, sr = read_xwav_audio(xwav_file_path)
-        print(f"Number of channels: {number_channels}, Bytes per sample: {bytes_per_sample}")
-        print(f"Sample rate: {sample_rate}, Start time: {wav_start_time}")
-        print(f"Data shape: {data.shape}")
 
+        #Check that the firmware the user wants to simulate is compatible with the xwav file
+        if data.shape[0] != expected_channels:
+           print(f"ERROR: {data.shape[0]} XWAV Channel(s) detected but chosen FW [{expected_channels}]. Change firmware or xwav directory. Exiting.")
+           sys.exit()
 
-
-
-
-
-class NpyFileProcessor:
-    """
-    Responsible for loading and transforming .npy files into byte data for streaming.
-    Complies with Single Responsibility Principle by focusing on data processing only.
-    """
-    @staticmethod
-    def processNpyFile(npyFile, arguments, returnDict, 
-                       packetSize, numChan, dataScale, 
-                       stretch, tdoaSim, cosShift, fw):
-        """
-        Load the .npy file and prepare it for UDP transmission.
-        The processed bytes are stored in a shared returnDict under 'dataBytes'.
-        """
-        print("Loading file:", npyFile)
-        rawDataMatrix = np.load(npyFile, mmap_mode='r').T  # Transpose after loading
-
-        # Apply channel duplication and shifting if TDOA or cos_shift is specified.
-        if tdoaSim is not False:
-            shiftedDataMatrix = DuplicateAndShiftChannels(np.copy(rawDataMatrix), tdoaSim, numChan)
-        elif cosShift:
-            # Example shift calculation; feel free to expand logic as needed
-            shiftVal = int(66 * np.cos(0 / 5))
-            shiftedDataMatrix = DuplicateAndShiftChannels(np.copy(rawDataMatrix), shiftVal, numChan)
+        #Check if we should interleave the data.
+        #1240: 4-Channel. -1:Harp 1 Channel (Change this after discuss with Joe)
+        if fw == 1240 or fw==-1:
+            interleavedData = InterleaveData(data)
         else:
-            shiftedDataMatrix = np.copy(rawDataMatrix)
-
-        # Only firmware 1240 interleaving logic is implemented
-        if fw == 1240:
-            interleavedData = InterleaveData(shiftedDataMatrix)
-        else:
-            print("Error: Only firmware 1240 interleaving is implemented in this script.")
+            print("Unsupported firmware version")
             sys.exit()
 
-        scaledInterleavedData = ScaleData(interleavedData, dataScale, stretch)
-        processedDataBytes = ConvertToBytes(scaledInterleavedData)
+        scaledData = ScaleData(interleavedData, data_scale, stretch)
+        processedDataBytes = ConvertToBytes(scaledData)
 
-        returnDict['dataBytes'] = processedDataBytes
+        #Allows user to choose to use multiprocessing manager or not. If using multiple xwavs in folder, multiprocessing is recommended.
+        if return_dict is not None:
+            return_dict["dataBytes"] = processedDataBytes #multiprocessing
+        else:
+            return processedDataBytes #not multiprocessing
+
+        return processedDataBytes
 
 class DataSimulator:
     """
@@ -136,17 +102,30 @@ class DataSimulator:
         # Handle IP override
         if self.arguments.ip == "self":
             self.arguments.ip = "127.0.0.1"
+        
+        # Prepare list of .x.wav data files
+        self.xwavFiles = [ os.path.join(self.arguments.data_dir, f) for f in os.listdir(self.arguments.data_dir) if f.endswith('.x.wav')]
 
-        # Firmware-specific imports
-        if self.arguments.fw == 1550:
-            import firmware_config.firmware_1550 as fwConfig
-        elif self.arguments.fw == 1240:
-            import firmware_config.firmware_1240 as fwConfig
-        else:
-            print('ERROR: Unknown firmware version')
+        if(len(self.xwavFiles) == 0):
+            print(f"ERROR: No .x.wav files found in directory: {self.arguments.data_dir}. Exiting.")
             sys.exit()
 
-        # Store firmware constants for use throughout
+        header = XWAVhdr(self.xwavFiles[0])
+        num_channels = header.xhd["NumChannels"]
+
+        if num_channels == 4:
+            import firmware_config.firmware_1240 as fwConfig
+            self.fw = 1240
+            print(f"Simulating firmware version: 1240")
+        elif num_channels == 1:
+            import firmware_config.firmware_testH1C as fwConfig
+            self.fw = -1  # Harp 1 Channel (Change this to the real version after discussing with Joe)
+            print(f"Simulating firmware version: KC FAKE (REPLACE AFTER JOE TALK")
+        else:
+            print(f"ERROR: Unsupported channel count: {num_channels}")
+            sys.exit()
+
+        # Use inferred firmware constants
         self.packetSize = fwConfig.PACKET_SIZE
         self.numChannels = fwConfig.NUM_CHAN
         self.dataSize = fwConfig.DATA_SIZE
@@ -164,7 +143,6 @@ class DataSimulator:
         self.DATA_SCALE = 2**15
 
         # Print initial settings
-        print(f"Simulating firmware version: {self.arguments.fw}")
         print(f"Sending data to {self.arguments.ip} on port {self.arguments.port}")
 
         # If requested, read IMU data and update PACKET_SIZE accordingly
@@ -176,13 +154,6 @@ class DataSimulator:
             print("Packet size after IMU:", self.packetSize)
             print("IMU samples loaded:", len(self.imuByteData))
 
-        # Prepare list of .npy data files
-        self.npyFiles = sorted([
-            os.path.join(self.arguments.data_dir, f) 
-            for f in os.listdir(self.arguments.data_dir) 
-            if f.endswith('.npy')
-        ])
-
         #### Initialize multiprocessing manager and dictionary for data exchange
         # spin up a small “manager server” process under the hood to hold Python objects in a shared memory space, 
         # and hands out proxy objects back to your processes.
@@ -193,24 +164,20 @@ class DataSimulator:
         # Initialize socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Start date/time
-        self.currentDateTime = datetime.datetime(2000 + 23, 11, 5, 1, 1, 1, tzinfo=datetime.timezone.utc)
+        # Start date/time 
+        self.currentDateTime = header.raw["dnumStart"][0]
 
     def preloadFirstFile(self):
         """
         Preload the first file's data synchronously.
         """
-        NpyFileProcessor.processNpyFile(
-            npyFile=self.npyFiles[0],
-            arguments=self.arguments,
-            returnDict=self.returnDict,
-            packetSize=self.packetSize,
-            numChan=self.numChannels,
-            dataScale=self.DATA_SCALE,
+        XWAVFileProcessor.processXwavFile(
+            xwav_file_path=self.xwavFiles[0],
+            return_dict=self.returnDict,
+            expected_channels=self.numChannels,
+            data_scale=self.DATA_SCALE,
             stretch=self.arguments.stretch,
-            tdoaSim=self.arguments.tdoa_sim,
-            cosShift=self.arguments.cos_shift,
-            fw=self.arguments.fw
+            fw=self.fw
         )
         return self.returnDict['dataBytes']
 
@@ -219,18 +186,14 @@ class DataSimulator:
         Launch a separate process to preload the next file's data.
         """
         processNext = multiprocessing.Process(
-            target=NpyFileProcessor.processNpyFile,
+            target=XWAVFileProcessor.processXwavFile,
             args=(
-                self.npyFiles[fileIndex],
-                self.arguments,
+                self.xwavFiles[fileIndex],
                 returnDict,
-                self.packetSize,
                 self.numChannels,
                 self.DATA_SCALE,
                 self.arguments.stretch,
-                self.arguments.tdoa_sim,
-                self.arguments.cos_shift,
-                self.arguments.fw
+                self.fw
             )
         )
         processNext.start()
@@ -246,34 +209,19 @@ class DataSimulator:
         # Start preloading the next file if available
         nextProcess = None
         nextReturnDict = None
-        if len(self.npyFiles) > 1:
-            nextReturnDict = self.manager.dict()
-            nextFileIndex = 1
-            nextProcess = self.startFilePreloadProcess(nextFileIndex, nextReturnDict)
-
         currentFileIndex = 0
 
         while True:
             isFirstRead = True
-            startTime = time.time()
+            
             dataChunkIndex = 0  # renamed 'flag' -> 'dataChunkIndex'
 
-            k = 0
             while True:
-                k+=1
-                # If not the first read, reset the start time for measuring interval
-                if not isFirstRead:
-                    startTime = time.time()
-                atEnd = (len(currentDataBytes) // self.dataSize == dataChunkIndex)
-
-                # Loop logic
-                if self.arguments.loop and atEnd:
-                    dataChunkIndex = 0
-                elif self.arguments.cos_shift and atEnd:
-                    # If cos_shift is being used and we've hit the end, handle here if needed
-                    pass
-                elif atEnd and not self.arguments.loop and not self.arguments.cos_shift:
-                    # End of file reached
+                startByte = dataChunkIndex * self.dataSize
+                endByte = (dataChunkIndex + 1) * self.dataSize
+                startTime = time.time()
+                if startByte >= len(currentDataBytes):
+                    # If we've reached the end of the current data, break to load next file
                     break
 
                 # Prepare timestamp fields
@@ -291,52 +239,21 @@ class DataSimulator:
                 zeroPack = struct.pack("BB", 0, 0)
                 timeHeader = timePack + microPack + zeroPack
 
-                # Select data slice (handle high activity mode if specified)
-                if self.arguments.high_act:
-                    byteIndex = self.highAmplitudeIndex * self.numChannels * self.bytesPerSample
-                    offset = 10 * self.numChannels * self.bytesPerSample
-                    dataPacket = currentDataBytes[(byteIndex - offset):(byteIndex - offset) + self.dataSize]
-                else:
-                    startByte = dataChunkIndex * self.dataSize
-                    endByte = (dataChunkIndex + 1) * self.dataSize
-                    dataPacket = currentDataBytes[startByte:endByte]
-
-                # Combine time header + data
+                #Make the packet
+                dataPacket = currentDataBytes[startByte:endByte]
                 packet = timeHeader + dataPacket
 
-                # If IMU data is enabled, append the corresponding IMU data to the packet
+                #Handle IMU data if enabled
                 if self.arguments.imu and self.imuByteData is not None:
                     imuSample = self.imuByteData[dataChunkIndex % len(self.imuByteData)]
-                    imuPacket = struct.pack(f"{len(imuSample)}B", *imuSample)
-                    packet += imuPacket
-
-                # Time glitch manipulation
-                if self.arguments.time_glitch > 0 and self.arguments.time_glitch == dataChunkIndex:
-                    # Example glitch: add 103 microseconds
-                    self.currentDateTime += timedelta(microseconds=103)
-
-                # Data glitch manipulation
-                if self.arguments.data_glitch > 0 and self.arguments.data_glitch == dataChunkIndex:
-                    # Duplicate first 30 bytes of the packet onto the end
-                    packet += packet[:30]
-
-                # Sanity check on packet size, unless a data glitch was intentionally introduced
-                if len(packet) != self.packetSize and self.arguments.data_glitch == 0:
-                    print('ERROR: Packet length mismatch.')
-                    print('Data chunk index:', dataChunkIndex)
-                    break
-                
-
-                #if k==130:
-                #    adsfasdf
-                
+                    packet += struct.pack(f"{len(imuSample)}B", *imuSample)
 
                 # Send the UDP packet
                 self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
 
                 if isFirstRead:
+                    print("First packet sent.")
                     isFirstRead = False
-                    print("Transfer time (first packet):", time.time() - startTime)
 
                 # Increment time for next packet
                 self.currentDateTime += timedelta(microseconds=int(self.microIncrement))
@@ -361,7 +278,7 @@ class DataSimulator:
 
             # Start preloading the following file (if any)
             nextFileIndex = currentFileIndex + 1
-            if nextFileIndex < len(self.npyFiles):
+            if nextFileIndex < len(self.xwavFiles):
                 nextReturnDict = self.manager.dict()
                 nextProcess = self.startFilePreloadProcess(nextFileIndex, nextReturnDict)
             else:
@@ -371,16 +288,11 @@ class DataSimulator:
         self.socket.close()
 
 
-
-
 if __name__ == "__main__":
     # Parse command-line arguments
     arguments = ArgumentParserService.parseArguments()
-    print("Parsed arguments:", arguments)
-    print("1 Channel Example:")
-    XWAVFileProcessor.processXwavFile("G:\\GOM_DT_15_disk01\\GOM_DT_15_220713_013459.x.wav")
-
-    print("4 Channel Example:")
-    XWAVFileProcessor.processXwavFile("F:\\GOM_GC_14_01_C4_disk01\\GOM_GC_14_01_C4_210907_150027.x.wav")
-    #dataSimulator = DataSimulator(arguments)
-    #dataSimulator.run()
+    dataSimulator = DataSimulator(arguments)
+    dataSimulator.run()
+    
+    
+    
