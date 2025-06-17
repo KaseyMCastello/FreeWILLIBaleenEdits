@@ -4,10 +4,8 @@ import struct
 import socket
 import numpy as np
 import time
-import datetime
 from datetime import timedelta
 import argparse
-import psutil
 import os
 import sys
 import multiprocessing
@@ -17,16 +15,18 @@ from AudioStreamDescriptor import XWAVhdr
 #Added from npy version for xwavs
 import soundfile as sf
 
-'''Edits by Kasey to stream full wxav with no additional processing.
-NEED TO CHANGE: UTILS XWAV
-XWAV PROCESSOR
-'''
 
 #Local utilities (assumes these functions exist in utils_xWavSim.py)
 from utils_xWavSim import get_datetime, extract_wav_start, read_xwav_audio
 
 # Local utilities (assumes these functions exist in utils.py)
-from utils import SetHighPriority, ReadBinaryData, DuplicateAndShiftChannels, InterleaveData, ScaleData, ConvertToBytes, Sleep, TDOASimAction
+from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, ConvertToBytes, Sleep
+
+sys.argv.extend([
+    "--port", "1045",
+    "--ip", "192.168.1.235",
+    "--data_dir", r"C:\Users\kasey\Desktop\socalsim"
+])
 
 # Ensure this process runs with high priority.
 SetHighPriority(15)  # nice value = -15
@@ -259,8 +259,7 @@ class DataSimulator:
                 self.currentDateTime += timedelta(microseconds=int(self.microIncrement))
 
                 # Attempt to maintain real-time pacing
-                elapsedRuntime = time.time() - startTime
-                sleepTime = (self.microIncrement * 1e-6) - elapsedRuntime
+                sleepTime = (self.microIncrement * 1e-6)
                 Sleep(sleepTime)
 
                 dataChunkIndex += 1
