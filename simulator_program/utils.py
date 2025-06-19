@@ -215,9 +215,20 @@ def ScaleData(dataFlattened, scale, toStretch):
     return dataFlattened
 
 
-def ConvertToBytes(dataFlattenedScaled):
-    formatString = '>{}H'.format(len(dataFlattenedScaled))          # encode data as big-endian
-    return struct.pack(formatString, *dataFlattenedScaled)
+def ConvertToBytes(data):
+    # If data is int16, shift to unsigned range
+    if np.issubdtype(data.dtype, np.signedinteger):
+        data = data.astype(np.int32)  # avoid overflow
+        data = data + 32768           # shift to 0–65535 range
+        data = np.clip(data, 0, 65535).astype(np.uint16)
+    else:
+        data = np.clip(data, 0, 65535).astype(np.uint16)
+
+    # Flatten and convert to bytes
+    dataFlattened = data.flatten()
+    formatString = f'>{len(dataFlattened)}H'  # Big endian unsigned shorts
+    return struct.pack(formatString, *dataFlattened)
+
 
 
 def ReadBinaryData(filename):

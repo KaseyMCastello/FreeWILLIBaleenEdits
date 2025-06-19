@@ -11,6 +11,8 @@ get_datetime: Joshua Zingale (June 3rd, 2024)
 from AudioStreamDescriptor import XWAVhdr
 from datetime import timedelta
 import numpy as np
+import struct
+import scipy.io.wavfile as wav
 
 
 def get_datetime(xwav_time: float, xwav):
@@ -57,3 +59,36 @@ def read_xwav_audio(filepath):
     audio = np.frombuffer(raw, dtype=dtype)
     audio = audio.reshape(-1, n_channels).T  #remove interleaving for ease of testing shape: [channels, samples]
     return audio, header.xhd["SampleRate"]
+
+def reconstruct_wav_from_packet(packet_bytes, num_channels=1, sample_rate=200000, header_size=12, output_path="reconstructed.wav"):
+    """
+    Reconstruct a .wav file from a UDP data packet containing interleaved audio bytes.
+    
+    Parameters:
+        packet_bytes (bytes): Full UDP packet, including header + audio
+        num_channels (int): Number of interleaved channels (default 4)
+        sample_rate (int): Original sampling rate in Hz (e.g., 200000)
+        header_size (int): Size of timestamp header at start of packet (default 8 bytes)
+        output_path (str): Where to save the reconstructed .wav file
+    """
+
+    # 1. Remove time header from the start
+    audio_bytes = packet_bytes[header_size:]
+
+    # 2. Unpack bytes to uint16
+    num_samples = len(audio_bytes) // 2  # 2 bytes per uint16
+    audio_uint16 = struct.unpack(f'>{num_samples}H', audio_bytes)
+    audio_uint16 = np.array(audio_uint16, dtype=np.uint16)
+
+    # 3. Convert to int16 by reversing +32768 offset
+    audio_int16 = (audio_uint16.astype(np.int32) - 32768).astype(np.int16)
+
+    # 4. Reshape into (samples, channels)
+    if num_samples % num_channels != 0:
+        raise ValueError(f"Data length {num_samples} is not divisible by {num_channels} channels.")
+
+    audio_int16 = audio_int16.reshape(-1, num_channels)
+
+    # 5. Save as .wav
+    wav.write(output_path, sample_rate, audio_int16)
+    print(f"WAV written to: {output_path}")
