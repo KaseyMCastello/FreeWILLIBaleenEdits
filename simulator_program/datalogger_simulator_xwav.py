@@ -10,6 +10,8 @@ import os
 import sys
 import multiprocessing
 from AudioStreamDescriptor import XWAVhdr
+import scipy.io.wavfile as wav
+import math
 
 
 #Added from npy version for xwavs
@@ -17,7 +19,8 @@ import soundfile as sf
 
 
 #Local utilities (assumes these functions exist in utils_xWavSim.py)
-from utils_xWavSim import get_datetime, extract_wav_start, read_xwav_audio
+from firmware_config.firmware_1240 import NUM_CHAN
+from utils_xWavSim import get_datetime, extract_wav_start, read_xwav_audio, reconstruct_wav_from_packet
 
 # Local utilities (assumes these functions exist in utils.py)
 from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, ConvertToBytes, Sleep
@@ -25,7 +28,7 @@ from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, C
 sys.argv.extend([
     "--port", "1045",
     "--ip", "192.168.1.235",
-    "--data_dir", r"C:\Users\kasey\Desktop\socalsim"
+    "--data_dir", r"H:\SOCAL_E_77_disk02"
 ])
 
 # Ensure this process runs with high priority.
@@ -54,7 +57,7 @@ class XWAVFileProcessor:
     Adapts .npy processor to  handle .xwav files, including reading headers and data.
     """
     @staticmethod
-    def processXwavFile(xwav_file_path, return_dict, expected_channels, data_scale, stretch, fw):
+    def processXwavFile(xwav_file_path, return_dict, expected_channels, fw):
         """
         Load the .xwav file and prepare it for UDP transmission.
         The processed bytes are stored in a shared returnDict under 'dataBytes'.
@@ -79,17 +82,14 @@ class XWAVFileProcessor:
         else:
             print("Unsupported firmware version")
             sys.exit()
-
-        scaledData = ScaleData(interleavedData, data_scale, stretch)
-        processedDataBytes = ConvertToBytes(scaledData)
-
+        
+        processedDataBytes = ConvertToBytes(interleavedData)
+        
         #Allows user to choose to use multiprocessing manager or not. If using multiple xwavs in folder, multiprocessing is recommended.
         if return_dict is not None:
             return_dict["dataBytes"] = processedDataBytes #multiprocessing
         else:
             return processedDataBytes #not multiprocessing
-
-        return processedDataBytes
 
 class DataSimulator:
     """
@@ -112,7 +112,9 @@ class DataSimulator:
 
         header = XWAVhdr(self.xwavFiles[0])
         num_channels = header.xhd["NumChannels"]
+        sr = header.xhd["SampleRate"]
 
+        # Determine firmware based on number of channels
         if num_channels == 4:
             import firmware_config.firmware_1240 as fwConfig
             self.fw = 1240
@@ -126,11 +128,13 @@ class DataSimulator:
             sys.exit()
 
         # Use inferred firmware constants
-        self.packetSize = fwConfig.PACKET_SIZE
+        self.packetSize = fwConfig.PACKET_SIZE 
         self.numChannels = fwConfig.NUM_CHAN
         self.dataSize = fwConfig.DATA_SIZE
         self.bytesPerSample = fwConfig.BYTES_PER_SAMP
         self.microIncrement = fwConfig.MICRO_INCR
+        self.sr = sr
+        self.headSize = fwConfig.HEAD_SIZE
 
         # If certain firmware files define additional constants, reference them conditionally:
         # E.g. firmware_1550 or firmware_1240 might define `highAmplitudeIndex`
@@ -138,9 +142,6 @@ class DataSimulator:
             self.highAmplitudeIndex = fwConfig.highAmplitudeIndex
         else:
             self.highAmplitudeIndex = 0  # or define another sensible default if not present
-
-        # For scaling data
-        self.DATA_SCALE = 2**15
 
         # Print initial settings
         print(f"Sending data to {self.arguments.ip} on port {self.arguments.port}")
@@ -175,8 +176,6 @@ class DataSimulator:
             xwav_file_path=self.xwavFiles[0],
             return_dict=self.returnDict,
             expected_channels=self.numChannels,
-            data_scale=self.DATA_SCALE,
-            stretch=self.arguments.stretch,
             fw=self.fw
         )
         return self.returnDict['dataBytes']
@@ -191,8 +190,6 @@ class DataSimulator:
                 self.xwavFiles[fileIndex],
                 returnDict,
                 self.numChannels,
-                self.DATA_SCALE,
-                self.arguments.stretch,
                 self.fw
             )
         )
@@ -217,8 +214,8 @@ class DataSimulator:
             dataChunkIndex = 0  # renamed 'flag' -> 'dataChunkIndex'
 
             while True:
-                startByte = dataChunkIndex * self.dataSize
-                endByte = (dataChunkIndex + 1) * self.dataSize
+                startByte = math.floor(dataChunkIndex * self.dataSize)
+                endByte = math.floor((dataChunkIndex + 1) * self.dataSize)
                 startTime = time.time()
                 if startByte >= len(currentDataBytes):
                     # If we've reached the end of the current data, break to load next file
@@ -241,6 +238,16 @@ class DataSimulator:
 
                 #Make the packet
                 dataPacket = currentDataBytes[startByte:endByte]
+                
+                #For debugging packet distortion
+               
+                #start_time = self.currentDateTime
+                #timestamp_str = start_time.strftime("%Y%m%d_%H%M%S")
+                #output_filename = f"firstPacket_{timestamp_str}.wav"
+                #output_pathFull = os.path.join(r"C:\Users\Kasey\Desktop\WhaleMoanOutput_Michaela", output_filename)
+                #reconstruct_wav_from_packet(dataPacket, num_channels=self.numChannels, sample_rate = self.sr, header_size=self.headSize, output_path=output_pathFull)
+                
+                
                 packet = timeHeader + dataPacket
 
                 #Handle IMU data if enabled
