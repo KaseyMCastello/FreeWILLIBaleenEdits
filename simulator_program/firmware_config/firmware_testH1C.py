@@ -1,8 +1,8 @@
-SAMPLE_RATE = 200000                # Sample rate (Hz)
+SAMPLE_RATE = 2000              # Sample rate (Hz)
 HEAD_SIZE = 12                     # packet head size (bytes)
 MICRO_INCR = 1240               # time between packets
 NUM_CHAN = 1;                      # number of channels per packet
-SAMPS_PER_CHANNEL = 248;           #1240 ms (200000 Hz * 0.001 s) *1.240 ms /sample
+SAMPS_PER_CHANNEL = 2;           #1240 ms (200000 Hz * 0.001 s) *1.240 ms /sample
 BYTES_PER_SAMP = 2;                                             # bytes per sample
 DATA_SIZE = SAMPS_PER_CHANNEL * NUM_CHAN * BYTES_PER_SAMP;   # packet data size (bytes) = 1240
 PACKET_SIZE = HEAD_SIZE + DATA_SIZE;                            # packet size (bytes) = 1252

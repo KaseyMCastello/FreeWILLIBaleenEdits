@@ -1,3 +1,4 @@
+from encodings.punycode import T
 from pyexpat.errors import XML_ERROR_UNKNOWN_ENCODING
 from re import X
 import struct
@@ -13,10 +14,8 @@ from AudioStreamDescriptor import XWAVhdr
 import scipy.io.wavfile as wav
 import math
 
-
 #Added from npy version for xwavs
 import soundfile as sf
-
 
 #Local utilities (assumes these functions exist in utils_xWavSim.py)
 from firmware_config.firmware_1240 import NUM_CHAN
@@ -27,8 +26,8 @@ from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, C
 
 sys.argv.extend([
     "--port", "1045",
-    "--ip", "192.168.1.235",
-    "--data_dir", r"H:\SOCAL_E_77_disk02"
+    "--ip", "192.168.137.2",
+    "--data_dir", r"E:\Lab Work\RealtimeWork"
 ])
 
 # Ensure this process runs with high priority.
@@ -42,7 +41,7 @@ class ArgumentParserService:
         parser = argparse.ArgumentParser(description='Program command line arguments')
         parser.add_argument('--port', default=1045, type=int, help='UDP port to send data to')
         parser.add_argument('--ip', default="192.168.7.2", type=str, help='IP address to send data to')
-        parser.add_argument('--data_dir', default="simulator_data/track132_5minchunks/", type=str, help='Directory containing .npy data files')
+        parser.add_argument('--data_dir', default="", type=str, help='Directory containing .x.wav data files')
         parser.add_argument('--loop', action='store_true', help='Enable looping over the data')
         parser.add_argument('--stretch', action='store_true', help='Normalize data values to the min/max range of 16-bit unsigned int')
         parser.add_argument('--imu', action='store_true', help='Read in IMU data from file')
@@ -51,45 +50,99 @@ class ArgumentParserService:
 
 class XWAVFileProcessor:
     """
-    Responsible for loading and transforming .xwav files into byte data for streaming.
+    Responsible for loading and transforming .xwav files into a dictionary of 75s data chunks, each with a timestamp. 
+    This will later be converted to a UDP packet for transmission.
+
+
+    return: chunk_dict (format (chunk start time: 75s of audio data.))
     
+    NOTE: If there are any gaps in the data, they will be padded on the end of chunks as zeros.
     Added by K.C.
     Adapts .npy processor to  handle .xwav files, including reading headers and data.
     """
     @staticmethod
-    def processXwavFile(xwav_file_path, return_dict, expected_channels, fw):
+    def processXwavFile(xwav_file_path, return_dict, expected_channels, fw, packet_time):
         """
         Load the .xwav file and prepare it for UDP transmission.
         The processed bytes are stored in a shared returnDict under 'dataBytes'.
         """
         print("Loading file:", xwav_file_path)
         # Load the xwav file header to extract metadata
-        wav_start_time = extract_wav_start(xwav_file_path)
-        header = XWAVhdr(xwav_file_path)
+        xwav = XWAVhdr(xwav_file_path)
+        sr = xwav.xhd['SampleRate']
+        n_channels = xwav.xhd['NumChannels']
+        bps = xwav.xhd['BitsPerSample']
+        bytes_per_sample = bps / 8
+
+        # Compute number of samples per raw file
+        samples_per_raw = [int(b / (n_channels * bytes_per_sample)) for b in xwav.xhd['byte_length']]
+        dnum_start = xwav.raw['dnumStart'] # datetime list of raw file starts
+        chunk_time = 75
+        chunk_samples = chunk_time * sr
+
+        current_time = None
+        prev_end_time = None
+        sample_ptr = 0
+
+        chunk_dict = {}
         
-        #print(f"Loaded waveform with shape: {waveform.shape} and sample rate: {sr}")
-        data, sr = read_xwav_audio(xwav_file_path)
-
-        #Check that the firmware the user wants to simulate is compatible with the xwav file
-        if data.shape[0] != expected_channels:
-           print(f"ERROR: {data.shape[0]} XWAV Channel(s) detected but chosen FW [{expected_channels}]. Change firmware or xwav directory. Exiting.")
-           sys.exit()
-
+        waveform, sr = read_xwav_audio(xwav_file_path)
+        buffer = np.empty((waveform.shape[0], 0), dtype=waveform.dtype)
+        
+        for i, n_samples in enumerate(samples_per_raw):
+            raw_time = dnum_start[i]
+            raw_audio = waveform[:, sample_ptr:sample_ptr + n_samples]
+            sample_ptr += n_samples
+            # Check if the raw audo has any time gaps in it. If so, fill the gaps with zeros.
+            if(prev_end_time and (raw_time - prev_end_time).total_seconds() > 1):
+                gap_sec = (raw_time - prev_end_time).total_seconds()
+                # Pad and save buffer if it has any data
+                if buffer.shape[1] > 0:
+                    pad_len = chunk_samples - buffer.shape[1]
+                    padded = np.pad(buffer, ((0, 0), (0, pad_len)), mode='constant', constant_values=0)
+                    chunk_dict[current_time] = padded
+                # Insert silent chunks to fill the time gap
+                num_silent_chunks = int(gap_sec // chunk_time)
+                for g in range(num_silent_chunks):
+                    zero_chunk = np.zeros((waveform.shape[0], chunk_samples), dtype=waveform.dtype)
+                    silent_time = prev_end_time + timedelta(seconds=g * chunk_time)
+                    chunk_dict[silent_time] = zero_chunk
+                # Reset buffer and current time
+                buffer = raw_audio
+                current_time = raw_time
+            #Otherwise, no gap and we can append the raw audio to the buffer
+            else:
+                # No gap, continue accumulating
+                if buffer.shape[1] == 0:
+                    current_time = raw_time
+                buffer = np.concatenate((buffer, raw_audio), axis=1)
+            while( buffer.shape[1] >= chunk_samples):
+                chunk = buffer[:, :chunk_samples]
+                chunk_dict[current_time] = chunk
+                buffer = buffer[:, chunk_samples:]
+                current_time += timedelta(seconds=chunk_time)
+            prev_end_time = raw_time + timedelta(seconds=n_samples / sr)
+        # Final chunk (pad if needed)
+        if buffer.shape[1] > 0:
+            padded = torch.nn.functional.pad(buffer, (0, chunk_samples - buffer.shape[1]), 'constant', 0)
+            chunk_dict[current_time] = padded
+       
         #Check if we should interleave the data.
         #1240: 4-Channel. -1:Harp 1 Channel (Change this after discuss with Joe)
         if fw == 1240 or fw==-1:
-            interleavedData = InterleaveData(data)
+            for start_time in chunk_dict:
+                chunk = chunk_dict[start_time]              # shape: (channels, chunk_samples)
+                interleaved_chunk = InterleaveData(chunk)   # flatten column-wise, shape: (channels * chunk_samples,)
+                chunk_dict[start_time] = interleaved_chunk  # replace original chunk with interleaved vector
         else:
             print("Unsupported firmware version")
             sys.exit()
-        
-        processedDataBytes = ConvertToBytes(interleavedData)
-        
+       
         #Allows user to choose to use multiprocessing manager or not. If using multiple xwavs in folder, multiprocessing is recommended.
         if return_dict is not None:
-            return_dict["dataBytes"] = processedDataBytes #multiprocessing
+            return_dict["chunk_dict"] = chunk_dict  # store raw chunks here
         else:
-            return processedDataBytes #not multiprocessing
+            return chunk_dict
 
 class DataSimulator:
     """
@@ -112,7 +165,7 @@ class DataSimulator:
 
         header = XWAVhdr(self.xwavFiles[0])
         num_channels = header.xhd["NumChannels"]
-        sr = header.xhd["SampleRate"]
+        sr = header.xhd['SampleRate']
 
         # Determine firmware based on number of channels
         if num_channels == 4:
@@ -133,27 +186,19 @@ class DataSimulator:
         self.dataSize = fwConfig.DATA_SIZE
         self.bytesPerSample = fwConfig.BYTES_PER_SAMP
         self.microIncrement = fwConfig.MICRO_INCR
-        self.sr = sr
+        self.sr = fwConfig.SAMPLE_RATE
         self.headSize = fwConfig.HEAD_SIZE
 
-        # If certain firmware files define additional constants, reference them conditionally:
-        # E.g. firmware_1550 or firmware_1240 might define `highAmplitudeIndex`
-        if hasattr(fwConfig, 'highAmplitudeIndex'):
-            self.highAmplitudeIndex = fwConfig.highAmplitudeIndex
-        else:
-            self.highAmplitudeIndex = 0  # or define another sensible default if not present
+        #Check that the firmware the user wants to simulate is compatible with the xwav file
+        if num_channels != self.numChannels:
+           print(f"ERROR: {num_channels} XWAV Channel(s) detected from file but chosen FW expects {self.numChannels} channels. Change firmware or xwav directory. Exiting.")
+           sys.exit() 
+        if sr != self.sr:
+           print(f"ERROR: {sr} Hz detected from file but chosen FW expects {self.sr} Hz. Change firmware or xwav directory. Exiting.")
+           sys.exit() 
 
         # Print initial settings
         print(f"Sending data to {self.arguments.ip} on port {self.arguments.port}")
-
-        # If requested, read IMU data and update PACKET_SIZE accordingly
-        self.imuByteData = None
-        if self.arguments.imu:
-            self.imuByteData = ReadBinaryData("../../IMU_matlab/202518_stationary.imu")
-            print("Packet size before IMU:", self.packetSize)
-            self.packetSize += len(self.imuByteData[0])
-            print("Packet size after IMU:", self.packetSize)
-            print("IMU samples loaded:", len(self.imuByteData))
 
         #### Initialize multiprocessing manager and dictionary for data exchange
         # spin up a small “manager server” process under the hood to hold Python objects in a shared memory space, 
@@ -165,32 +210,24 @@ class DataSimulator:
         # Initialize socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Start date/time 
-        self.currentDateTime = header.raw["dnumStart"][0]
-
     def preloadFirstFile(self):
         """
         Preload the first file's data synchronously.
         """
-        XWAVFileProcessor.processXwavFile(
-            xwav_file_path=self.xwavFiles[0],
-            return_dict=self.returnDict,
-            expected_channels=self.numChannels,
-            fw=self.fw
-        )
-        return self.returnDict['dataBytes']
+        XWAVFileProcessor.processXwavFile( xwav_file_path=self.xwavFiles[0], return_dict=self.returnDict,expected_channels=self.numChannels, fw=self.fw,  packet_time=self.microIncrement)
+        return self.returnDict["chunk_dict"]
 
     def startFilePreloadProcess(self, fileIndex, returnDict):
         """
         Launch a separate process to preload the next file's data.
         """
-        processNext = multiprocessing.Process(
-            target=XWAVFileProcessor.processXwavFile,
+        processNext = multiprocessing.Process( target=XWAVFileProcessor.processXwavFile,
             args=(
                 self.xwavFiles[fileIndex],
                 returnDict,
                 self.numChannels,
-                self.fw
+                self.fw,
+                self.microIncrement
             )
         )
         processNext.start()
@@ -201,86 +238,80 @@ class DataSimulator:
         Main loop that streams data from .npy files over UDP, handles optional looping, 
         time/data glitches, and IMU data concatenation.
         """
-        currentDataBytes = self.preloadFirstFile()
-
+        currentChunkHolder = self.preloadFirstFile()
+        
         # Start preloading the next file if available
         nextProcess = None
         nextReturnDict = None
         currentFileIndex = 0
 
-        while True:
-            isFirstRead = True
+        firstPacketSent = False
+        packet_interval = self.microIncrement / 1e6 # Convert microseconds to seconds for sleep timing
+        packetIndex = 0;
+        realWorldStartTime = time.time()
+        while True: 
             
-            dataChunkIndex = 0  # renamed 'flag' -> 'dataChunkIndex'
+            for start_time, chunk_data in currentChunkHolder.items():
+                currentDataBytes = ConvertToBytes(chunk_data)
+                dataChunkIndex = 0
+                time1 = time.time()
+                while True:
+                    startByte = dataChunkIndex * self.dataSize
+                    endByte = (dataChunkIndex + 1) * self.dataSize
 
-            while True:
-                startByte = math.floor(dataChunkIndex * self.dataSize)
-                endByte = math.floor((dataChunkIndex + 1) * self.dataSize)
-                startTime = time.time()
-                if startByte >= len(currentDataBytes):
-                    # If we've reached the end of the current data, break to load next file
-                    break
+                    if startByte >= len(currentDataBytes):
+                        # If we've reached the end of the current data, break to load next chunk
+                        break
 
-                # Prepare timestamp fields
-                year = self.currentDateTime.year - 2000
-                month = self.currentDateTime.month
-                day = self.currentDateTime.day
-                hour = self.currentDateTime.hour
-                minute = self.currentDateTime.minute
-                second = self.currentDateTime.second
-                microseconds = self.currentDateTime.microsecond
+                    #Send the right time in the packet. (Data chunk time start plus the increment times its packet number.)
+                    packet_time = start_time + timedelta(seconds=dataChunkIndex * (self.microIncrement / 1e6))
+                    
+                    # Prepare timestamp fields
+                    year = packet_time.year - 2000
+                    month = packet_time.month
+                    day = packet_time.day
+                    hour = packet_time.hour
+                    minute = packet_time.minute
+                    second = packet_time.second
+                    microseconds = packet_time.microsecond
 
-                # Build the time header
-                timePack = struct.pack("BBBBBB", year, month, day, hour, minute, second)
-                microPack = microseconds.to_bytes(4, byteorder='big')
-                zeroPack = struct.pack("BB", 0, 0)
-                timeHeader = timePack + microPack + zeroPack
+                    # Build the time header
+                    timePack = struct.pack("BBBBBB", year, month, day, hour, minute, second)
+                    microPack = microseconds.to_bytes(4, byteorder='big')
+                    zeroPack = struct.pack("BB", 0, 0)
+                    timeHeader = timePack + microPack + zeroPack
 
-                #Make the packet
-                dataPacket = currentDataBytes[startByte:endByte]
-                
-                #For debugging packet distortion
-               
-                #start_time = self.currentDateTime
-                #timestamp_str = start_time.strftime("%Y%m%d_%H%M%S")
-                #output_filename = f"firstPacket_{timestamp_str}.wav"
-                #output_pathFull = os.path.join(r"C:\Users\Kasey\Desktop\WhaleMoanOutput_Michaela", output_filename)
-                #reconstruct_wav_from_packet(dataPacket, num_channels=self.numChannels, sample_rate = self.sr, header_size=self.headSize, output_path=output_pathFull)
-                
-                
-                packet = timeHeader + dataPacket
+                    #Make the packet
+                    dataPacket = currentDataBytes[startByte:endByte]
+                    packet = timeHeader + dataPacket
 
-                #Handle IMU data if enabled
-                if self.arguments.imu and self.imuByteData is not None:
-                    imuSample = self.imuByteData[dataChunkIndex % len(self.imuByteData)]
-                    packet += struct.pack(f"{len(imuSample)}B", *imuSample)
+                    # Send the UDP packet
+                    self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
 
-                # Send the UDP packet
-                self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
-
-                if isFirstRead:
-                    print("First packet sent.")
-                    isFirstRead = False
-
-                # Increment time for next packet
-                self.currentDateTime += timedelta(microseconds=int(self.microIncrement))
-
-                # Attempt to maintain real-time pacing
-                sleepTime = (self.microIncrement * 1e-6)
-                Sleep(sleepTime)
-
-                dataChunkIndex += 1
-                
+                    if not firstPacketSent:
+                        print("First packet sent.")
+                        firstPacketSent = True
+                    
+                    # Attempt to maintain real-time pacing
+                    # --- Drift correction sleep ---
+                    time_to_sleep = packet_interval * 0.8000
+                    if time_to_sleep > 0:
+                        Sleep(time_to_sleep)
+                    # else: we're running late — don't sleep, just send the next packet immediately
+                    
+                    dataChunkIndex += 1
+                    packetIndex +=1 
+                    
             # ensures that, before we switch buffers, the preload worker has definitely finished writing into
             if nextProcess is not None:
                 nextProcess.join()
 
             currentFileIndex += 1
-            if currentFileIndex >= len(self.npyFiles):
+            if currentFileIndex >= len(self.xwavFiles):
                 break  # No more files to process
 
             # Move to the newly loaded data
-            currentDataBytes = nextReturnDict['dataBytes'] if nextReturnDict else None
+            currentChunkHolder = nextReturnDict["chunk_dict"] if nextReturnDict else None
 
             # Start preloading the following file (if any)
             nextFileIndex = currentFileIndex + 1
