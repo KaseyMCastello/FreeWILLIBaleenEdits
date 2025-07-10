@@ -25,9 +25,9 @@ from utils_xWavSim import get_datetime, extract_wav_start, read_xwav_audio, reco
 from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, ConvertToBytes, Sleep
 
 sys.argv.extend([
-    "--port", "1045",
-    "--ip", "192.168.137.2",
-    "--data_dir", r"E:\Lab Work\RealtimeWork"
+    "--port", "5005",
+    "--ip", "127.0.0.1",
+    "--data_dir", r"C:\Users\kasey\Desktop\socalsim"
 ])
 
 # Ensure this process runs with high priority.
@@ -248,13 +248,16 @@ class DataSimulator:
         firstPacketSent = False
         packet_interval = self.microIncrement / 1e6 # Convert microseconds to seconds for sleep timing
         packetIndex = 0;
+        leftover_bytes = b''
         realWorldStartTime = time.time()
         while True: 
             
             for start_time, chunk_data in currentChunkHolder.items():
                 currentDataBytes = ConvertToBytes(chunk_data)
+                currentDataBytes = leftover_bytes + currentDataBytes
+                leftover_bytes = b''
                 dataChunkIndex = 0
-                time1 = time.time()
+                
                 while True:
                     startByte = dataChunkIndex * self.dataSize
                     endByte = (dataChunkIndex + 1) * self.dataSize
@@ -283,7 +286,11 @@ class DataSimulator:
 
                     #Make the packet
                     dataPacket = currentDataBytes[startByte:endByte]
-                    packet = timeHeader + dataPacket
+                    if len(dataPacket) < 496:
+                        leftover_bytes = dataPacket
+                        break
+                    else:
+                        packet = timeHeader + dataPacket
 
                     # Send the UDP packet
                     self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
