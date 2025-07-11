@@ -27,7 +27,7 @@ from utils import SetHighPriority, ReadBinaryData,  InterleaveData, ScaleData, C
 sys.argv.extend([
     "--port", "5005",
     "--ip", "127.0.0.1",
-    "--data_dir", r"C:\Users\kasey\Desktop\socalsim"
+    "--data_dir", r"H:\SOCAL34N\SOCAL34N_disk01"
 ])
 
 # Ensure this process runs with high priority.
@@ -137,7 +137,6 @@ class XWAVFileProcessor:
         else:
             print("Unsupported firmware version")
             sys.exit()
-       
         #Allows user to choose to use multiprocessing manager or not. If using multiple xwavs in folder, multiprocessing is recommended.
         if return_dict is not None:
             return_dict["chunk_dict"] = chunk_dict  # store raw chunks here
@@ -247,7 +246,8 @@ class DataSimulator:
 
         firstPacketSent = False
         packet_interval = self.microIncrement / 1e6 # Convert microseconds to seconds for sleep timing
-        packetIndex = 0;
+        packetIndex = 0
+        cumExtraTime = 0
         leftover_bytes = b''
         realWorldStartTime = time.time()
         while True: 
@@ -255,9 +255,14 @@ class DataSimulator:
             for start_time, chunk_data in currentChunkHolder.items():
                 currentDataBytes = ConvertToBytes(chunk_data)
                 currentDataBytes = leftover_bytes + currentDataBytes
+
+                # Calculate how much time the leftover bytes represent
+                leftover_packet_count = len(leftover_bytes) / self.dataSize
+                
+                start_time = start_time - timedelta(microseconds=leftover_packet_count * self.microIncrement) # Adjust start time based on leftover bytes
                 leftover_bytes = b''
                 dataChunkIndex = 0
-                
+                print(f"Chunk start time: {start_time}, chunk duration: {chunk_data.shape[-1] / self.sr} s")
                 while True:
                     startByte = dataChunkIndex * self.dataSize
                     endByte = (dataChunkIndex + 1) * self.dataSize
@@ -267,7 +272,7 @@ class DataSimulator:
                         break
 
                     #Send the right time in the packet. (Data chunk time start plus the increment times its packet number.)
-                    packet_time = start_time + timedelta(seconds=dataChunkIndex * (self.microIncrement / 1e6))
+                    packet_time = start_time + timedelta(microseconds=packetIndex * self.microIncrement)
                     
                     # Prepare timestamp fields
                     year = packet_time.year - 2000
@@ -283,17 +288,16 @@ class DataSimulator:
                     microPack = microseconds.to_bytes(4, byteorder='big')
                     zeroPack = struct.pack("BB", 0, 0)
                     timeHeader = timePack + microPack + zeroPack
-
+                    
                     #Make the packet
                     dataPacket = currentDataBytes[startByte:endByte]
-                    if len(dataPacket) < 496:
+                    if len(dataPacket) < self.dataSize:
                         leftover_bytes = dataPacket
                         break
                     else:
                         packet = timeHeader + dataPacket
-
-                    # Send the UDP packet
-                    self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
+                        # Send the UDP packet
+                        self.socket.sendto(packet, (self.arguments.ip, self.arguments.port))
 
                     if not firstPacketSent:
                         print("First packet sent.")
